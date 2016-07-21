@@ -1,6 +1,8 @@
 #include <curl/curl.h>
 #include <getopt.h>
+#if 0
 #include <libusb-1.0/libusb.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -10,65 +12,38 @@
 #define castifcpp(type, x) ((x))
 #endif
 
-#undef curl_easy_setopt
-#define curl_easy_setopt(handle, opt, param)                               \
-    _Pragma("clang diagnostic push")                                       \
-        _Pragma("clang diagnostic ignored \"-Wdisabled-macro-expansion\"") \
-            curl_easy_setopt(handle, opt, param)                           \
-                _Pragma("clang diagnostic pop")
-
 typedef struct {
     char* content;
     size_t length;
 } response_t;
 
-static char*
-get_node(const char* buffer, const char* x, const char* y)
-{
-    register const char *s, *e;
-    if ((s = strstr(buffer, x))) {
-        if ((e = strstr(s, y))) {
-            register const size_t es = (size_t)(e - s);
-            char* o = castifcpp(char*, malloc(es + 1));
-            if (!o) {
-                fputs("malloc failed.\n", stderr);
-                return NULL;
-            }
-            memcpy(o, s, es);
-            o[es] = '\0';
-            return o;
-        }
-    }
-    return NULL;
-}
-
-static char*
-get_n_node(const char* haystack, const char* needle, const size_t size)
-{
-    register const char* s;
-    if ((s = strstr(haystack, needle))) {
-        char* o = castifcpp(char*, malloc(size + 1));
-        if (!o) {
-            fputs("\x1B[31malloc failed.\x1b[0m\n", stderr);
-            return NULL;
-        }
-        memcpy(o, s, size);
-        o[size] = '\0';
-        return o;
-    }
-    return NULL;
-}
-
-#define get_n_blob(to, haystack, needle, size)                             \
+#define get_blob(to, haystack, needle, needlend, size)                     \
     do {                                                                   \
-        char* node = get_n_node(haystack, "<key>" needle "</key>", size);  \
-        if (!node) {                                                       \
+        register char *start, *end;                                        \
+        if ((start = strstr(haystack, "<key>" needle "</key>")) == NULL) { \
+            free(to);                                                      \
             fprintf(stderr, "\x1B[31mUnable to find %s\x1b[0m\n", needle); \
             return -1;                                                     \
         }                                                                  \
-        strncat(to, node, size);                                           \
-        free(node);                                                        \
-        haystack += size;                                                  \
+        if ((end = strstr(start, needlend)) == NULL) {                     \
+            free(to);                                                      \
+            return -1;                                                     \
+        }                                                                  \
+        strncat(to, start, (size_t)(end - start) + size);                  \
+        haystack = end + size;                                             \
+    } while (0)
+
+#define get_partialdigest(to, haystack, needle, size)                 \
+    do {                                                              \
+        register char *start, *end;                                   \
+        if ((start = strstr(haystack, "<key>PartialDigest</key>"))) { \
+            if ((end = strstr(start, needle))) {                      \
+                strncat(to, start, (size_t)(end - start) + size);     \
+                haystack = end + size;                                \
+            } else {                                                  \
+                strcat(to, "<key>Trusted</key><true/></dict>");       \
+            }                                                         \
+        }                                                             \
     } while (0)
 
 static inline __attribute__((always_inline)) void
@@ -117,7 +92,7 @@ tss_request_send(const char* request, const char* url)
         header = curl_slist_append(header, "Cache-Control: no-cache");
         header = curl_slist_append(header, "Content-type: text/xml; charset=\"utf-8\"");
         header = curl_slist_append(header, "Expect:");
-        
+
         response = castifcpp(response_t*, malloc(sizeof(response_t)));
         if (!response) {
             fprintf(stderr, "\x1B[31mUnable to allocate sufficent memory\x1b[0m\n");
@@ -135,7 +110,6 @@ tss_request_send(const char* request, const char* url)
         curl_easy_setopt(handle, CURLOPT_USERAGENT, "Parser/1.0");
         curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, strlen(request));
         curl_easy_setopt(handle, CURLOPT_URL, url);
-        curl_easy_setopt(handle, CURLOPT_PROXY, "127.0.0.1:8080");
         curl_easy_setopt(handle, CURLOPT_TIMEOUT, 20L);
         curl_easy_perform(handle);
         curl_slist_free_all(header);
@@ -154,7 +128,7 @@ tss_request_send(const char* request, const char* url)
 }
 
 static int
-parsend(const char* filename, const char* url, const char* ecid)
+parsend(const char* filename, const char* url, char* ecid)
 {
     FILE* file = fopen(filename, "r");
 
@@ -202,160 +176,94 @@ parsend(const char* filename, const char* url, const char* ecid)
 
     strip(buffer);
     buffer += 206;
-    char buf[3137] = { '\0' };
-    char *manifest, *llb_node, *llb_digest, *llb_partial_digest, *ibec_node, *ibec_digest, *ibec_partialdigest, *ibss_node, *ibss_digest, *ibss_partial_digest;
+    char* buf = castifcpp(char*, malloc(strlen(buffer) + strlen(ecid) + 1));
     strcpy(buf, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple Computer//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>@APTicket</key><true/><key>@BBTicket</key><true/><key>ApNonce</key><data>EzcTNxM3EzcTNxM3EzcTNxM3Ezc=</data><key>ApECID</key><string>");
     strcat(buf, ecid);
     strcat(buf, "</string><key>ApProductionMode</key><true/>");
-    get_n_blob(buf, buffer, "ApBoardID", 41);
-    get_n_blob(buf, buffer, "ApChipID", 42);
-    get_n_blob(buf, buffer, "ApSecurityDomain", 48);
-    if (!(manifest = strstr(buffer, "<key>Manifest</key>"))) {
-        fputs("\x1B[31mUnable to find Manifest\x1b[0m\n", stderr);
+    get_blob(buf, buffer, "ApBoardID", "</string>", 9);
+    get_blob(buf, buffer, "ApChipID", "</string>", 9);
+    get_blob(buf, buffer, "ApSecurityDomain", "</string>", 9);
+
+    register char *s, *e;
+    if (!(s = strstr(buffer, "<key>Manifest</key>"))) {
+        free(buf);
         return -1;
     }
-    get_n_blob(buf, manifest, "AppleLogo", 84);
-    strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "BatteryCharging0", 91);
-    strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "BatteryCharging1", 91);
-    strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "BatteryFull", 86);
-    strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "BatteryLow0", 86);
-    strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "BatteryLow1", 86);
-    strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "BatteryPlugin", 88);
-    strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "DeviceTree", 85);
-    strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "KernelCache", 86);
-    strcat(buf, "<key>Trusted</key><true/></dict>");
-    llb_node = get_node(manifest, "<key>LLB</key>", "<dict><key>Digest");
-    if (!llb_node) {
-        fputs("\x1B[31mUnable to find LLB\x1b[0m\n", stderr);
-        return -1;
+    s += 25;
+    e = strstr(s, "<key>ApBoardID</key>");
+    if (e) {
+        s[e - s] = '\0';
     }
 
-    llb_digest = get_node(llb_node, "<key>LLB</key>", "<key>Info");
-    if (!llb_digest) {
-        free(llb_node);
-        fputs("\x1B[31mUnable to find LLB Digest\x1b[0m\n", stderr);
-        return -1;
-    }
-    strncat(buf, llb_digest, 145);
-    free(llb_digest);
-
-    llb_partial_digest = get_node(llb_node, "<key>PartialDigest</key>", "</dict><key>OS");
-    if (!llb_partial_digest) {
-        free(llb_node);
-        fputs("\x1B[34mUnable to find LLB PartialDigest (APTicket)\x1b[0m\n", stderr);
-    } else {
-        free(llb_node);
-        strncat(buf, llb_partial_digest, 102);
-        free(llb_partial_digest);
-    }
+    get_blob(buf, s, "AppleLogo", "</data>", 7);
+    strcat(buf, "<key>Trusted</key><true/></dict>");
+    get_blob(buf, s, "BatteryCharging0", "</data>", 7);
+    strcat(buf, "<key>Trusted</key><true/></dict>");
+    get_blob(buf, s, "BatteryCharging1", "</data>", 7);
+    strcat(buf, "<key>Trusted</key><true/></dict>");
+    get_blob(buf, s, "BatteryFull", "</data>", 7);
+    strcat(buf, "<key>Trusted</key><true/></dict>");
+    get_blob(buf, s, "BatteryLow0", "</data>", 7);
+    strcat(buf, "<key>Trusted</key><true/></dict>");
+    get_blob(buf, s, "BatteryLow1", "</data>", 7);
+    strcat(buf, "<key>Trusted</key><true/></dict>");
+    get_blob(buf, s, "BatteryPlugin", "</data>", 7);
+    strcat(buf, "<key>Trusted</key><true/></dict>");
+    get_blob(buf, s, "DeviceTree", "</data>", 7);
+    strcat(buf, "<key>Trusted</key><true/></dict>");
+    get_blob(buf, s, "KernelCache", "</data>", 7);
+    strcat(buf, "<key>Trusted</key><true/></dict>");
+    get_blob(buf, s, "LLB", "</data>", 7);
+    get_partialdigest(buf, s, "</dict><key>OS", 7);
+    get_blob(buf, s, "RecoveryMode", "</data>", 7);
     strcat(buf, "</dict>");
-
-    get_n_blob(buf, manifest, "RecoveryMode", 87);
-    strcat(buf, "</dict>");
-    get_n_blob(buf, manifest, "RestoreDeviceTree", 92);
+    get_blob(buf, s, "RestoreDeviceTree", "</data>", 7);
     strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "RestoreKernelCache", 93);
+    get_blob(buf, s, "RestoreKernelCache", "</data>", 7);
     strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "RestoreLogo", 86);
+    get_blob(buf, s, "RestoreLogo", "</data>", 7);
     strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "RestoreRamDisk", 89);
+    get_blob(buf, s, "RestoreRamDisk", "</data>", 7);
     strcat(buf, "<key>Trusted</key><true/></dict>");
-
-    ibec_node = get_node(manifest, "<key>iBEC</key>", "<dict><key>Digest");
-    if (!ibec_node) {
-        fputs("\x1B[31mUnable to find iBEC\x1b[0m\n", stderr);
-        return -1;
-    }
-
-    ibec_digest = get_node(ibec_node, "<key>iBEC</key>", "<key>Info");
-    if (!ibec_digest) {
-        free(ibec_node);
-        fputs("\x1B[31mUnable to find iBEC Digest\x1b[0m\n", stderr);
-        return -1;
-    }
-    strncat(buf, ibec_digest, 145);
-    free(ibec_digest);
-
-    ibec_partialdigest = get_node(ibec_node, "<key>PartialDigest</key>", "</dict><key>iBSS");
-    if (!ibec_partialdigest) {
-        free(ibec_node);
-        fputs("\x1B[34mUnable to find iBEC PartialDigest (APTicket)\x1b[0m\n", stderr);
-    } else {
-        free(ibec_node);
-        strncat(buf, ibec_partialdigest, 102);
-        free(ibec_partialdigest);
-    }
-    strcat(buf, "</dict>");
-
-    ibss_node = get_node(manifest, "<key>iBSS</key>", "<dict><key>Digest");
-    if (!ibss_node) {
-        fputs("\x1B[31mUnable to find iBSS\x1b[0m\n", stderr);
-        return -1;
-    }
-
-    ibss_digest = get_node(ibss_node, "<key>iBSS</key>", "<key>Info");
-    if (!ibss_digest) {
-        free(ibss_node);
-        fputs("\x1B[31mUnable to find iBSS Digest\x1b[0m\n", stderr);
-        return -1;
-    }
-    strncat(buf, ibss_digest, 145);
-    free(ibss_digest);
-
-    ibss_partial_digest = get_node(ibss_node, "<key>PartialDigest</key>", "</dict><key>iBoot");
-    if (!ibss_partial_digest) {
-        free(ibss_node);
-        fputs("\x1B[34mUnable to find iBSS PartialDigest (APTicket)\x1b[0m\n", stderr);
-    } else {
-        free(ibss_node);
-        strncat(buf, ibss_partial_digest, 102);
-        free(ibss_partial_digest);
-    }
-    strcat(buf, "</dict>");
-
-    get_n_blob(buf, manifest, "iBoot", 80);
+    get_blob(buf, s, "iBEC", "</data>", 7);
+    get_partialdigest(buf, s, "</dict><key>iBSS", 7);
+    get_blob(buf, s, "iBSS", "</data>", 7);
+    get_partialdigest(buf, s, "</dict><key>iBoot", 7);
+    get_blob(buf, s, "iBoot", "</data>", 7);
     strcat(buf, "<key>Trusted</key><true/></dict>");
-    get_n_blob(buf, manifest, "UniqueBuildID", 65);
-    strcat(buf, "</dict></plist>");
+    get_blob(buf, s, "UniqueBuildID", "</dict>", 7);
+    strcat(buf, "</plist>");
+
     response_t* response = NULL;
     if (!(response = tss_request_send(buf, url))) {
+        free(buf);
         return -1;
     }
+    free(buf);
     response->content += 40;
 
-    char* product_version = get_node(buffer, "<key>ProductVersion</key><string>", "</string>");
-    if (!product_version) {
-        fputs("\x1B[31mUnable to find ProductVersion\x1b[0m\n", stderr);
-        return -1;
-    }
-    product_version += 33;
-    printf("\x1B[34mVersion: %s\x1b[0m\n", product_version);
-    char out[255];
-    snprintf(out, 255, "%s.shsh.plist", product_version);
+    strcat(ecid, ".shsh.plist");
 
-    FILE* fout = fopen(out, "w");
+    FILE* fout = fopen(ecid, "w");
     if (!fout) {
+        free(response);
         return -1;
     }
 
     if (fwrite(response->content, 1, response->length, fout) != response->length) {
+        free(response);
         (void)fclose(fout);
         return -1;
     }
-    printf("\x1B[34mBlobs written to %s\x1b[0m\n", out);
+    free(response);
+
+    printf("\x1B[34mBlobs written to %s\x1b[0m\n", ecid);
 
     (void)fclose(fout);
     return 0;
 }
 
+#if 0
 static __attribute((__unused__)) char*
 get_nonce(const char* ecid)
 {
@@ -412,11 +320,12 @@ error:
     libusb_exit(NULL);
     return NULL;
 }
+#endif
 
 int main(int argc, char* argv[])
 {
     int c;
-    const char *manifest = NULL, *tss = "https://gs.apple.com/TSS/controller?action=2", *ecid = NULL;
+    char *manifest = NULL, *tss = "https://gs.apple.com/TSS/controller?action=2", *ecid = NULL;
 
     if (argc < 3) {
         fprintf(stderr, "\x1B[34m%s -b <BuildManifest.plist> -t [TSS Server] -e [ECID]\x1b[0m\n", argv[0]);
@@ -433,9 +342,6 @@ int main(int argc, char* argv[])
             break;
         case 'e':
             ecid = optarg;
-            if (strlen(ecid) > 16) {
-                return -1;
-            }
             break;
         case '?':
             return -1;
